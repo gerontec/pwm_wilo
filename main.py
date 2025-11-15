@@ -1,121 +1,348 @@
-# pwmfeedback.py
-# Modul zur Verarbeitung des Wilo-PWM-Feedback-Signals (Pin 5)
-# V2.10: Duty Cycle Berechnung basiert auf 75Hz-Nennfrequenz (Fix aus V2.9)
-#        + NEU: Hinzufügen einer menschenlesbaren Status-Meldung basierend auf der Wilo-Spezifikation.
-
-from machine import Pin
+# main.py – WILO PUMPE STEUERUNG (v2.10-status-map-fix)
+# Hauptsteuerung mit ausgelagertem PWM-Feedback-Modul
+# ######################################################################
+import time
+import gc
+import network
+from machine import Pin, PWM, Timer, WDT, ADC
+from umqtt.simple import MQTTClient
+import sys
+import os
+import ujson 
 import utime
-import math
+import pwmfeedback 
 
 # ==================== KONFIGURATION ====================
-TACHO_TIMEOUT_MS = 50       
-MIN_PULSE_WIDTH_US = 2000   
-PIN_FEEDBACK = 5            
-NOMINAL_PERIOD_US = 1000000.0 / 75.0 # 13333.33 µs (Nominale 75 Hz Periode)
+WATCHDOG_ENABLED = True
+WATCHDOG_TIMEOUT = 8000 # ms
+PWM_MIN_HARD = 0
+PWM_MAX = 64000
+RAMP_DURATION = 16.0 # Sekunden für sanfte Rampe
 
-# Wilo PWM Output Status Mapping (siehe Dokumentation Seite 15 ff.)
-# Die Bereiche wurden leicht angepasst, um Rundungsfehler und Grenzfälle robust abzudecken.
-STATUS_MAP = [
-    # Wichtig: Höchste Priorität/Grenzen zuerst prüfen!
-    (lambda d: d >= 97.5, "Interface Damaged / Power OFF (100%)"),
-    (lambda d: d >= 92.5, "Permanent Failure (95%) - Pump stopped due to internal error"),
-    (lambda d: d >= 82.5 and d <= 92.5, "Abnormal Function Mode (85-90%) - Temporarily stopped/Warning"),
-    (lambda d: d > 77.5 and d < 82.5, "Abnormal Running Mode (80%) - Not optimal performance"),
-    (lambda d: d >= 5.0 and d <= 77.5, "Normal Operation (5-75%) - Flow/Power feedback"),
-    (lambda d: d >= 1.5 and d < 5.0, "Stand-by (2%) - Active stop mode by PWM-Input"),
-    (lambda d: d < 1.5, "Interface Damaged / Low Pulse (<2%)"),
-]
+TARGET_PWM = 29000
+INTERVAL_SECONDS = 900 # 15 Minuten
+BOOST_DURATION = 5 # 5 Sekunden
 
-# ==================== GLOBALE VARIABLEN (IRQ-gesteuert) ====================
-last_pin5_time_us = utime.ticks_us()
-pin5_high_time_us = 0
-pin5_low_time_us = 0
-pin5_flank_time_us = 0
-last_pulse_time_us = utime.ticks_us() 
+mqtt_server = '192.168.178.23'
+client_id = 'picow2'
+topic_sub_pump  = b'heatp/pump'
+topic_pub       = b'heatp/pico120'
+topic_pins      = b'heatp/pins'
 
-# ==================== FLANKENZEIT-MESSUNG CALLBACK (IRQ) ====================
+FIRMWARE_VERSION = "v2.10-status-map-fix" # Version aktualisiert
+start_time = time.time()
 
-def pin5_callback(pin):
-    """
-    Speichert die Dauer der HIGH- und LOW-Flanke separat.
-    """
-    global last_pin5_time_us, pin5_flank_time_us, pin5_high_time_us, pin5_low_time_us, last_pulse_time_us
+# ==================== GLOBALE VARIABLEN ====================
+current_pwm = PWM_MAX
+target_pwm = PWM_MAX
+ramp_start_time = None
+ramp_start_value = None
+last_boost_start = 0
+boost_active = False
+timers = []
+client = None
 
-    current_time_us = utime.ticks_us()
+# ==================== HARDWARE & PIN-DEFINITIONEN ====================
+pwm0 = PWM(Pin(0), freq=150)
+pwm0.duty_u16(PWM_MAX)
+
+LED = Pin("LED", Pin.OUT)
+LED.on() 
+
+feedback_pin7 = Pin(7, Pin.IN, Pin.PULL_UP)
+test_pin1 = Pin(1, Pin.IN, Pin.PULL_UP)
+pump_feedback_pin19 = Pin(19, Pin.IN) 
+
+# Pin 5 Initialisierung über das Modul
+feedback_pin5 = pwmfeedback.init_feedback_pin() 
+
+# ADC Pins
+adc26 = ADC(Pin(26))
+adc27 = ADC(Pin(27))
+adc28 = ADC(Pin(28))
+
+# WLAN Setup
+sta = network.WLAN(network.STA_IF)
+sta.active(True)
+sta.connect("f24", "9876543210")
+
+# Watchdog Setup
+if WATCHDOG_ENABLED:
+    wdt = WDT(timeout=WATCHDOG_TIMEOUT)
+
+def feed_watchdog():
+    if WATCHDOG_ENABLED and wdt:
+        wdt.feed()
+
+# ----------------------------------------------------------------------
+## 🔗 MQTT LOGGING und Hilfsfunktionen
+# ----------------------------------------------------------------------
+
+def mqtt_log(msg):
+    try:
+        if client:
+            ts = time.localtime()
+            payload = f"{ts[3]:02d}:{ts[4]:02d}:{ts[5]:02d} - {msg}"
+            client.publish(b'heatp/log', payload.encode())
+    except:
+        pass
+    feed_watchdog()
+
+def get_mem_percent():
+    try:
+        gc.collect()
+        return int(gc.mem_alloc() / (gc.mem_alloc() + gc.mem_free()) * 100)
+    except:
+        return 0.0
+
+def read_adc_voltage(adc):
+    try:
+        raw = adc.read_u16()
+        return round((raw / 65535) * 3.3, 3)
+    except:
+        return 0.0
+
+# ----------------------------------------------------------------------
+## 📊 MQTT-Payload-Erzeugung (Modularisiert)
+# ----------------------------------------------------------------------
+
+def publish_all_pins(t):
     
-    time_diff_us = utime.ticks_diff(current_time_us, last_pin5_time_us)
-
-    if time_diff_us > MIN_PULSE_WIDTH_US:
-        if pin.value() == 1:
-            pin5_low_time_us = time_diff_us
-        else:
-            pin5_high_time_us = time_diff_us
+    # --- PUMPEN FEEDBACK aus Modul ---
+    feedback_data = pwmfeedback.get_pump_feedback(feedback_pin5.value())
             
-        pin5_flank_time_us = time_diff_us 
+    # --- ENDE PWM BERECHNUNG ---
+
+    try:
+        ip = sta.ifconfig()[0] if sta.isconnected() else "0.0.0.0"
+        wlan_status = 1 if sta.isconnected() else 0
+        mem_pct = get_mem_percent()
+        uptime = int(time.time() - start_time)
+
+        mp_version = f"{os.uname().sysname} v{os.uname().version.split()[0]}"
+        build_date = os.uname().version.split(';')[1].strip() if ';' in os.uname().version else "unknown"
+        machine = os.uname().machine
         
-        last_pin5_time_us = current_time_us 
-        last_pulse_time_us = current_time_us 
+        full_fw = f"{FIRMWARE_VERSION} | {mp_version} | {machine} | {build_date}"
 
-# ==================== STATUS-LOGIK ====================
+        pins = {
+            "FW": full_fw, 
+            "UPTIME": uptime,
+            "WLAN": wlan_status,
+            "LED": LED.value(),
+            "PWM": current_pwm, # current_pwm ist jetzt synchronisiert
+            "PIN0": current_pwm, 
+            "PIN1": test_pin1.value(),
+            "PIN7": feedback_pin7.value(),
+            
+            # FEEDBACK LOGIK aus Modul
+            "PIN5": feedback_data["PIN5"],
+            "PIN5_Flank_us": feedback_data["PIN5_Flank_us"],
+            "PIN5_HIGH_us": feedback_data["PIN5_HIGH_us"],
+            "PIN5_LOW_us": feedback_data["PIN5_LOW_us"],
+            "PIN5_Freq_Hz": feedback_data["PIN5_Freq_Hz"],
+            "PumpDuty": feedback_data["PumpDuty"], 
+            "PumpStatus": feedback_data["PumpStatus"], 
+            
+            "PIN19": pump_feedback_pin19.value(),
+            "PumpFeedback": pump_feedback_pin19.value(), 
 
-def get_pump_status(duty_cycle):
-    """Gibt den menschenlesbaren Status basierend auf dem Wilo Duty Cycle zurück."""
-    for check, status in STATUS_MAP:
-        if check(duty_cycle):
-            return status
-    return "UNKNOWN STATUS"
+            # ADC PINS
+            "PIN26": read_adc_voltage(adc26),
+            "PIN27": read_adc_voltage(adc27),
+            "PIN28": read_adc_voltage(adc28),
+        }
 
+        # Schleife über die restlichen GPIOs
+        for gp in [2,3,4,6,8,9,10,11,12,13,14,15,16,17,18,20,21]:
+            if gp in (5, 19):
+                continue
+            try:
+                p = Pin(gp, Pin.IN)
+                val = p.value()
+                p.deinit()
+                pins[f"PIN{gp}"] = val
+            except:
+                pins[f"PIN{gp}"] = 0
 
-# ==================== INITIALISIERUNG & RÜCKGABE ====================
+        # JSON-Serialisierung
+        json_str = ujson.dumps(pins)
+        client.publish(topic_pins, json_str.encode())
 
-def init_feedback_pin():
-    """Initialisiert den Feedback-Pin und den Interrupt."""
-    feedback_pin = Pin(PIN_FEEDBACK, Pin.IN, Pin.PULL_UP)
-    feedback_pin.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=pin5_callback)
-    return feedback_pin
+        # Statusmeldung (kurze Form)
+        pin7_state = "LOW" if feedback_pin7.value() == 0 else "HIGH"
+        pin5_state = "LOW" if feedback_pin5.value() == 0 else "HIGH"
+        pump_state = "LOW" if pump_feedback_pin19.value() == 0 else "HIGH"
+        pump_duty_cycle_pct = feedback_data["PumpDuty"] 
+        pump_status_text = feedback_data["PumpStatus"]
+        
+        status = f"PWM:{current_pwm},IP:{ip},MEM:{mem_pct}%,PIN7:{pin7_state},PIN5:{pin5_state},PUMP:{pump_state},Duty:{pump_duty_cycle_pct}%,Status:{pump_status_text}"
+        client.publish(topic_pub, status.encode())
 
-def get_pump_feedback(current_pin_value):
-    """
-    Berechnet die Frequenz und den Duty Cycle (konstante 75Hz Periode).
-    Gibt ein Dictionary mit den Feedback-Werten zurück.
-    """
-    now_us = utime.ticks_us()
-    time_since_last_pulse_ms = utime.ticks_diff(now_us, last_pulse_time_us) / 1000
+    except Exception as e:
+        mqtt_log(f"publish_all_pins error: {e}")
+    feed_watchdog()
 
-    high_time = pin5_high_time_us
-    low_time = pin5_low_time_us
-    T_us_local = high_time + low_time
+# ----------------------------------------------------------------------
+## ⏱️ Steuerung und MQTT-Logik 
+# ----------------------------------------------------------------------
+
+def update_pwm_ramp(t):
+    global current_pwm, target_pwm, ramp_start_time, ramp_start_value
+    if ramp_start_time is None:
+        if current_pwm == target_pwm:
+            pwm0.duty_u16(current_pwm) 
+            return
+        ramp_start_time = time.time()
+        ramp_start_value = current_pwm
+
+    elapsed = time.time() - ramp_start_time
+    if elapsed >= RAMP_DURATION:
+        current_pwm = target_pwm
+        ramp_start_time = None
+        pwm0.duty_u16(current_pwm) 
+        return
+
+    progress = elapsed / RAMP_DURATION
+    new_pwm = int(ramp_start_value + (target_pwm - ramp_start_value) * progress)
+    new_pwm = max(PWM_MIN_HARD, min(PWM_MAX, new_pwm))
     
-    # Standardwerte bei Fehler/Timeout
-    freq = 0.0
-    duty = 0.0
-    json_flank_us = 0
-    json_high_us = 0
-    json_low_us = 0
-    status = "TIMEOUT / NO PULSE" # Standard-Status bei Timeout
+    if new_pwm != current_pwm:
+        current_pwm = new_pwm
+        pwm0.duty_u16(current_pwm) 
 
-    if time_since_last_pulse_ms < TACHO_TIMEOUT_MS and T_us_local > 0:
-        # 1. Frequenz (gemessen): Nur Diagnose
-        freq = 1.0 / (T_us_local * 0.000001)
-        
-        # 2. Duty Cycle (berechnet): Nutzt die NENN-Periode (FIX)
-        duty = (high_time / NOMINAL_PERIOD_US) * 100.0
-        duty = min(max(duty, 0.0), 100.0) # Limitierung
-        
-        # 3. Status ableiten
-        status = get_pump_status(duty)
+def boost_cycle(t):
+    global target_pwm, ramp_start_time, last_boost_start, boost_active, current_pwm
+    now = time.time()
+    if not boost_active and now - last_boost_start >= INTERVAL_SECONDS:
+        # BOOST START
+        mqtt_log("15-Min-Boost: 5s auf 100%")
+        target_pwm = PWM_MAX
+        ramp_start_time = None
+        pwm0.duty_u16(PWM_MAX) 
+        current_pwm = PWM_MAX # <--- FIX: current_pwm synchronisieren
+        LED.on() 
+        last_boost_start = now
+        boost_active = True
 
-        json_flank_us = pin5_flank_time_us
-        json_high_us = high_time
-        json_low_us = low_time
-            
-    # --- RÜCKGABE ---
-    return {
-        "PIN5": current_pin_value,
-        "PIN5_Flank_us": json_flank_us, 
-        "PIN5_HIGH_us": json_high_us, 
-        "PIN5_LOW_us": json_low_us, 
-        "PIN5_Freq_Hz": round(freq, 2), 
-        "PumpDuty": round(duty, 2), 
-        "PumpStatus": status, # NEUER STATUS-EINTRAG
-    }
+    if boost_active and now - last_boost_start >= BOOST_DURATION:
+        # BOOST ENDE
+        mqtt_log(f"Boost Ende → 16s Rampe auf {TARGET_PWM}")
+        target_pwm = TARGET_PWM
+        ramp_start_time = None
+        boost_active = False
+
+def sub_cb(topic, msg):
+    global target_pwm, ramp_start_time, last_boost_start, boost_active, current_pwm
+    try:
+        if topic == topic_sub_pump:
+            cmd = msg.decode().strip().lower()
+
+            if cmd == "reset":
+                mqtt_log("REMOTE RESET → Watchdog läuft aus in 8s")
+                for t in timers:
+                    try: t.deinit()
+                    except: pass
+                timers.clear()
+                try: 
+                    sta.active(False)
+                except: 
+                    pass
+                while True:
+                    pass
+
+            if cmd == "off":
+                target_pwm = 0
+                ramp_start_time = None
+                pwm0.duty_u16(0) 
+                current_pwm = 0 # <--- FIX: current_pwm synchronisieren
+                LED.off() 
+                boost_active = False
+                mqtt_log("Pumpe AUS")
+            elif cmd in ("auto", ""):
+                boost_active = True
+                last_boost_start = time.time() - INTERVAL_SECONDS + 10
+                LED.on() 
+                mqtt_log("Auto reaktiviert")
+            elif cmd.isdigit():
+                val = int(cmd)
+                target_pwm = max(0, val)
+                ramp_start_time = None
+                boost_active = False
+                if target_pwm > 0:
+                    LED.on() 
+                else:
+                    LED.off()
+                mqtt_log(f"Manuell → {val}")
+            elif cmd == "on":
+                target_pwm = PWM_MAX
+                ramp_start_time = None
+                pwm0.duty_u16(PWM_MAX) # Hardware direkt setzen
+                current_pwm = PWM_MAX # <--- FIX: current_pwm synchronisieren
+                boost_active = False
+                LED.on() 
+                mqtt_log("Manuell → 100%")
+            else:
+                mqtt_log(f"Unbekannt: {cmd}")
+
+            publish_all_pins(None)
+        feed_watchdog()
+    except Exception as e:
+        mqtt_log(f"sub_cb error: {e}")
+
+def mqtt_connect():
+    try:
+        # ANNAHME: Broker braucht keine Auth
+        c = MQTTClient(client_id, mqtt_server, keepalive=300) 
+        c.set_callback(sub_cb)
+        c.connect()
+        mqtt_log("MQTT verbunden")
+        c.subscribe(topic_sub_pump)
+        return c
+    except:
+        return None
+
+def reconnect():
+    global client
+    for _ in range(5):
+        client = mqtt_connect()
+        if client: return
+        feed_watchdog()
+    mqtt_log("FATAL → Reset")
+    # Lässt den Watchdog auslösen
+    while True: pass
+
+def add_timer(period, callback):
+    t = Timer()
+    t.init(period=period, mode=Timer.PERIODIC, callback=callback)
+    timers.append(t)
+
+# ----------------------------------------------------------------------
+## 🚀 INIT & HAUPTSCHLEIFE 
+# ----------------------------------------------------------------------
+
+client = mqtt_connect()
+LED.on() 
+# Warten auf WLAN
+while not sta.isconnected():
+    feed_watchdog()
+
+ip = sta.ifconfig()[0]
+mqtt_log(f"Start – IP: {ip} | FW: {FIRMWARE_VERSION}")
+publish_all_pins(None)
+
+# Timer-Initialisierung
+add_timer(200,      update_pwm_ramp)
+add_timer(1000,     boost_cycle)
+add_timer(5000,     publish_all_pins)
+add_timer(240000,   lambda t: client.ping() if client else None)
+add_timer(3600000,  lambda t: (gc.collect(), mqtt_log(f"GC: {gc.mem_free()}")))
+
+while True:
+    try:
+        if client:
+            client.check_msg()
+        feed_watchdog()
+    except Exception as e:
+        mqtt_log(f"Error: {e}")
+        reconnect()
