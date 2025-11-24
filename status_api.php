@@ -1,50 +1,32 @@
- cat status_api.php 
 <?php
-// ######################################################################
-// # status_api.php - Ruft den letzten MQTT-Payload aus Redis ab
-// ######################################################################
-
-// Setze Content-Type auf JSON
 header('Content-Type: application/json');
 
-// Redis Konfiguration
-$redis_host = '127.0.0.1';
-$redis_port = 6379;
-$redis_key  = 'wilo:pump:status:pins'; // Muss dem Schlüssel der Python-Bridge entsprechen
+// Redis
+$redis = new Redis();
+$redis->connect('127.0.0.1', 6379);
 
-try {
-    // 1. Redis-Verbindung herstellen
-    $redis = new Redis();
-    
-    // Stellen Sie sicher, dass die PHP-Redis-Erweiterung installiert ist (php-redis)
-    if (!$redis->connect($redis_host, $redis_port)) {
-        throw new Exception("Could not connect to Redis server.");
-    }
-    
-    // 2. Wert abrufen
-    // Dieser Wert enthält nun automatisch das neue Feld "PumpStatus"
-    $json_data = $redis->get($redis_key);
+$status_key = 'wilo:pump:status:pins';
+$stats_key  = 'wilo:pump:stats:watchdog';
 
-    if ($json_data === false || $json_data === null) {
-        // Fehler, wenn der Schlüssel nicht existiert (noch keine Daten vom Pico W empfangen)
-        echo json_encode([
-            'error' => 'No status data found. Waiting for first MQTT message on heatp/pins.',
-            'key' => $redis_key,
-            'timestamp' => time()
-        ]);
-        http_response_code(404);
-    } else {
-        // 3. JSON-Daten ausgeben (diese sind bereits vom Pico W serialisiert)
-        echo $json_data; 
-    }
-    
-} catch (Exception $e) {
-    // Fehler bei Redis-Verbindung oder PHP-Erweiterung fehlt
-    echo json_encode([
-        'error' => 'Backend API Error',
-        'message' => $e->getMessage()
-    ]);
-    http_response_code(500);
+$status_json = $redis->get($status_key);
+$stats_raw   = $redis->hGetAll($stats_key);  // Alle Monate als assoc array
+
+if (!$status_json) {
+    echo json_encode(['error' => 'No status data']);
+    exit;
 }
 
+// Parse Status und erweitere um Stats
+$status = json_decode($status_json, true);
+
+$stats = [
+    "watchdog_resets_per_month" => $stats_raw ?: new stdClass(),
+    "total_resets_ever" => array_sum($stats_raw ?: []),
+    "last_reset_month"  => $stats_raw ? array_key_first(array_reverse($stats_raw, true)) : null,
+    "resets_this_month" => $stats_raw[date('Y-m')] ?? 0
+];
+
+$status['STATS'] = $stats;
+
+echo json_encode($status, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
 ?>
