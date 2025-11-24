@@ -8,9 +8,9 @@ from machine import Pin, PWM, Timer, WDT, ADC
 from umqtt.simple import MQTTClient
 import sys
 import os
-import ujson 
+import ujson
 import utime
-import pwmfeedback 
+import pwmfeedback
 
 # ==================== KONFIGURATION ====================
 WATCHDOG_ENABLED = True
@@ -303,14 +303,9 @@ def mqtt_connect():
         return None
 
 def reconnect():
-    global client
-    for _ in range(5):
-        client = mqtt_connect()
-        if client: return
-        feed_watchdog()
-    mqtt_log("FATAL → Reset")
-    # Lässt den Watchdog auslösen
-    while True: pass
+    mqtt_log("MQTT verloren → harter Reset in <8s")
+    time.sleep(9)      # länger als WDT → garantiert Reset
+    while True: pass   # fallback, falls sleep irgendwie überlebt
 
 def add_timer(period, callback):
     t = Timer()
